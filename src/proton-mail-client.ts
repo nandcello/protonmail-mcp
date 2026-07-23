@@ -1,7 +1,7 @@
-import { ImapFlow, type SearchObject } from "imapflow";
+import { ImapFlow, type ImapFlowOptions, type SearchObject } from "imapflow";
 import { simpleParser } from "mailparser";
 import { isIP } from "node:net";
-import nodemailer from "nodemailer";
+import nodemailer, { type SendMailOptions } from "nodemailer";
 import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
 import type { ProtonBridgeConfig } from "./config.ts";
 import {
@@ -25,8 +25,8 @@ export interface EmailSearch {
   from?: string;
   to?: string;
   subject?: string;
-  since?: string;
-  before?: string;
+  since?: Date;
+  before?: Date;
   unreadOnly?: boolean;
 }
 
@@ -52,13 +52,25 @@ export interface ConnectionStatus {
   smtp: { ok: boolean; error?: string };
 }
 
-function asDate(value: string | undefined): Date | undefined {
-  return value ? new Date(`${value}T00:00:00.000Z`) : undefined;
+export type ProtonImapClient = Pick<
+  ImapFlow,
+  "connect" | "logout" | "list" | "getMailboxLock" | "search" | "fetch" | "fetchOne"
+>;
+
+export interface ProtonSmtpTransport {
+  verify(): Promise<true>;
+  sendMail(options: SendMailOptions): Promise<SMTPTransport.SentMessageInfo>;
+  close(): void;
 }
 
-export function createImapClient(config: ProtonBridgeConfig) {
+export interface ProtonMailClientDependencies {
+  createImapClient(config: ProtonBridgeConfig): ProtonImapClient;
+  createSmtpTransport(config: ProtonBridgeConfig): ProtonSmtpTransport;
+}
+
+export function createImapOptions(config: ProtonBridgeConfig): ImapFlowOptions {
   const secure = config.security === "tls";
-  return new ImapFlow({
+  return {
     host: config.host,
     port: config.imapPort,
     secure,
@@ -76,11 +88,42 @@ export function createImapClient(config: ProtonBridgeConfig) {
       name: "protonmail-mcp",
       version: "0.1.0",
     },
-  });
+  };
 }
 
+export function createImapClient(config: ProtonBridgeConfig): ProtonImapClient {
+  return new ImapFlow(createImapOptions(config));
+}
+
+export function createSmtpOptions(config: ProtonBridgeConfig): SMTPTransport.Options {
+  const secure = config.security === "tls";
+  return {
+    host: config.host,
+    port: config.smtpPort,
+    secure,
+    requireTLS: !secure,
+    auth: {
+      user: config.username,
+      pass: config.password,
+    },
+    tls: config.tls,
+  };
+}
+
+export function createSmtpTransport(config: ProtonBridgeConfig): ProtonSmtpTransport {
+  return nodemailer.createTransport(createSmtpOptions(config));
+}
+
+const DEFAULT_DEPENDENCIES: ProtonMailClientDependencies = {
+  createImapClient,
+  createSmtpTransport,
+};
+
 export class ProtonMailClient {
-  constructor(private readonly config: ProtonBridgeConfig) {}
+  constructor(
+    private readonly config: ProtonBridgeConfig,
+    private readonly dependencies: ProtonMailClientDependencies = DEFAULT_DEPENDENCIES,
+  ) {}
 
   async connectionStatus(): Promise<ConnectionStatus> {
     const [imap, smtp] = await Promise.all([this.verifyImap(), this.verifySmtp()]);
@@ -120,8 +163,8 @@ export class ProtonMailClient {
         if (search.from) query.from = search.from;
         if (search.to) query.to = search.to;
         if (search.subject) query.subject = search.subject;
-        if (search.since) query.since = asDate(search.since);
-        if (search.before) query.before = asDate(search.before);
+        if (search.since) query.since = search.since;
+        if (search.before) query.before = search.before;
         if (search.unreadOnly) query.seen = false;
         if (Object.keys(query).length === 0) query.all = true;
 
@@ -169,7 +212,11 @@ export class ProtonMailClient {
           );
         }
 
-        const message = await client.fetchOne(uid, { source: true }, { uid: true });
+        const message = await client.fetchOne(
+          uid,
+          { source: { maxLength: this.config.maxMessageBytes + 1 } },
+          { uid: true },
+        );
         if (!message || !message.source) {
           throw new Error(`Could not download email UID ${uid} from ${mailbox}.`);
         }
@@ -254,28 +301,17 @@ export class ProtonMailClient {
   }
 
   private createImapClient() {
-    return createImapClient(this.config);
+    return this.dependencies.createImapClient(this.config);
   }
 
   private createSmtpTransport() {
-    const secure = this.config.security === "tls";
-    return nodemailer.createTransport({
-      host: this.config.host,
-      port: this.config.smtpPort,
-      secure,
-      requireTLS: !secure,
-      auth: {
-        user: this.config.username,
-        pass: this.config.password,
-      },
-      tls: this.config.tls,
-    } satisfies SMTPTransport.Options);
+    return this.dependencies.createSmtpTransport(this.config);
   }
 
-  private async withImap<T>(operation: (client: ImapFlow) => Promise<T>): Promise<T> {
+  private async withImap<T>(operation: (client: ProtonImapClient) => Promise<T>): Promise<T> {
     const client = this.createImapClient();
-    await client.connect();
     try {
+      await client.connect();
       return await operation(client);
     } finally {
       await client.logout().catch(() => undefined);

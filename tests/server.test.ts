@@ -58,4 +58,31 @@ describe("MCP server", () => {
       await server.close();
     }
   });
+
+  test("reports configuration failures from direct handlers as tool errors", async () => {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const server = createServer(() => {
+      throw new ConfigurationError("aliases unavailable without configuration");
+    });
+    const client = new Client({
+      name: "protonmail-mcp-test",
+      version: "1.0.0",
+    });
+
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      const response = await client.callTool({
+        name: "list_sender_aliases",
+        arguments: {},
+      });
+      expect(response.isError).toBe(true);
+      expect(response.content).toEqual([
+        { type: "text", text: "aliases unavailable without configuration" },
+      ]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 });

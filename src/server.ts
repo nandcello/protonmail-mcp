@@ -1,25 +1,38 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod/v4";
-import { ConfigurationError, loadConfig, publicConfig, type ProtonBridgeConfig } from "./config.ts";
+import { loadConfig, publicConfig, type ProtonBridgeConfig } from "./config.ts";
 import { errorMessage } from "./email-utils.ts";
 import { ProtonMailClient } from "./proton-mail-client.ts";
 
 const emailAddress = z.email();
 const mailbox = z.string().trim().min(1).default("INBOX");
 const limit = z.number().int().min(1).max(100).default(20);
-const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.");
+const calendarDate = z.iso
+  .date({ error: "Use a real calendar date in YYYY-MM-DD format." })
+  .transform((value) => new Date(`${value}T00:00:00.000Z`));
 
-function result(value: unknown) {
+function result(value: unknown): CallToolResult {
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
   };
 }
 
-function failure(error: unknown) {
+function failure(error: unknown): CallToolResult {
   return {
-    content: [{ type: "text" as const, text: errorMessage(error) }],
+    content: [{ type: "text", text: errorMessage(error) }],
     isError: true,
   };
+}
+
+async function withToolErrorHandling(
+  operation: () => CallToolResult | Promise<CallToolResult>,
+): Promise<CallToolResult> {
+  try {
+    return await operation();
+  } catch (error) {
+    return failure(error);
+  }
 }
 
 export function createServer(configProvider: () => ProtonBridgeConfig = loadConfig) {
@@ -55,21 +68,15 @@ export function createServer(configProvider: () => ProtonBridgeConfig = loadConf
         openWorldHint: false,
       },
     },
-    async () => {
-      try {
-        return await withClient(async (client, config) =>
+    () =>
+      withToolErrorHandling(() =>
+        withClient(async (client, config) =>
           result({
             config: publicConfig(config),
             connections: await client.connectionStatus(),
           }),
-        );
-      } catch (error) {
-        if (error instanceof ConfigurationError) {
-          return failure(error);
-        }
-        return failure(error);
-      }
-    },
+        ),
+      ),
   );
 
   server.registerTool(
@@ -86,18 +93,15 @@ export function createServer(configProvider: () => ProtonBridgeConfig = loadConf
         openWorldHint: false,
       },
     },
-    async () => {
-      try {
+    () =>
+      withToolErrorHandling(() => {
         const config = configProvider();
         return result({
           defaultFrom: config.defaultFrom ?? null,
           allowedSenders: [...config.allowedSenders],
           enforcementEnabled: config.allowedSenders.size > 0,
         });
-      } catch (error) {
-        return failure(error);
-      }
-    },
+      }),
   );
 
   server.registerTool(
@@ -114,15 +118,10 @@ export function createServer(configProvider: () => ProtonBridgeConfig = loadConf
         openWorldHint: false,
       },
     },
-    async () => {
-      try {
-        return await withClient(async (client) =>
-          result({ mailboxes: await client.listMailboxes() }),
-        );
-      } catch (error) {
-        return failure(error);
-      }
-    },
+    () =>
+      withToolErrorHandling(() =>
+        withClient(async (client) => result({ mailboxes: await client.listMailboxes() })),
+      ),
   );
 
   server.registerTool(
@@ -143,18 +142,15 @@ export function createServer(configProvider: () => ProtonBridgeConfig = loadConf
         openWorldHint: false,
       },
     },
-    async ({ mailbox, limit, unreadOnly }) => {
-      try {
-        return await withClient(async (client) =>
+    ({ mailbox, limit, unreadOnly }) =>
+      withToolErrorHandling(() =>
+        withClient(async (client) =>
           result({
             mailbox,
             emails: await client.listEmails(mailbox, limit, unreadOnly),
           }),
-        );
-      } catch (error) {
-        return failure(error);
-      }
-    },
+        ),
+      ),
   );
 
   server.registerTool(
@@ -169,8 +165,8 @@ export function createServer(configProvider: () => ProtonBridgeConfig = loadConf
         from: z.string().trim().min(1).optional(),
         to: z.string().trim().min(1).optional(),
         subject: z.string().trim().min(1).optional(),
-        since: isoDate.optional(),
-        before: isoDate.optional(),
+        since: calendarDate.optional(),
+        before: calendarDate.optional(),
         unreadOnly: z.boolean().default(false),
         limit,
       },
@@ -181,18 +177,15 @@ export function createServer(configProvider: () => ProtonBridgeConfig = loadConf
         openWorldHint: false,
       },
     },
-    async (search) => {
-      try {
-        return await withClient(async (client) =>
+    (search) =>
+      withToolErrorHandling(() =>
+        withClient(async (client) =>
           result({
             mailbox: search.mailbox,
             emails: await client.searchEmails(search),
           }),
-        );
-      } catch (error) {
-        return failure(error);
-      }
-    },
+        ),
+      ),
   );
 
   server.registerTool(
@@ -213,13 +206,10 @@ export function createServer(configProvider: () => ProtonBridgeConfig = loadConf
         openWorldHint: false,
       },
     },
-    async (request) => {
-      try {
-        return await withClient(async (client) => result(await client.readEmail(request)));
-      } catch (error) {
-        return failure(error);
-      }
-    },
+    (request) =>
+      withToolErrorHandling(() =>
+        withClient(async (client) => result(await client.readEmail(request))),
+      ),
   );
 
   server.registerTool(
@@ -248,13 +238,10 @@ export function createServer(configProvider: () => ProtonBridgeConfig = loadConf
         openWorldHint: true,
       },
     },
-    async ({ confirmed: _confirmed, ...email }) => {
-      try {
-        return await withClient(async (client) => result(await client.sendEmail(email)));
-      } catch (error) {
-        return failure(error);
-      }
-    },
+    ({ confirmed: _confirmed, ...email }) =>
+      withToolErrorHandling(() =>
+        withClient(async (client) => result(await client.sendEmail(email))),
+      ),
   );
 
   return server;
