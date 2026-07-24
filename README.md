@@ -10,19 +10,81 @@ testing, and packaging.
 
 ## Tools
 
-| Tool                  | Purpose                                                         |
-| --------------------- | --------------------------------------------------------------- |
-| `connection_status`   | Check configuration plus IMAP and SMTP authentication           |
-| `list_sender_aliases` | Show the sender identities configured for this MCP              |
-| `list_mailboxes`      | List folders and their message/unread counts                    |
-| `list_emails`         | List recent message metadata without changing read state        |
-| `search_emails`       | Search one mailbox by text, sender, recipient, subject, or date |
-| `read_email`          | Read a message by mailbox and UID without changing read state   |
-| `send_email`          | Send a confirmed message from a Proton address or alias         |
+| Tool                             | Purpose                                                         |
+| -------------------------------- | --------------------------------------------------------------- |
+| `connection_status`              | Check configuration plus IMAP and SMTP authentication           |
+| `list_sender_aliases`            | Show the sender identities configured for this MCP              |
+| `create_inbox_subscription`      | Explicitly opt a consumer into filtered inbox events            |
+| `list_inbox_subscriptions`       | List persistent notification subscriptions                      |
+| `update_inbox_subscription`      | Change a subscription's consumer or filters                     |
+| `set_inbox_subscription_enabled` | Pause or resume a subscription                                  |
+| `delete_inbox_subscription`      | Permanently delete a subscription                               |
+| `list_mailboxes`                 | List folders and their message/unread counts                    |
+| `list_emails`                    | List recent message metadata without changing read state        |
+| `search_emails`                  | Search one mailbox by text, sender, recipient, subject, or date |
+| `read_email`                     | Read a message by mailbox and UID without changing read state   |
+| `send_email`                     | Send a confirmed message from a Proton address or alias         |
 
 `send_email` requires `confirmed: true`. The MCP instructions tell clients to
 show the exact sender, recipients, subject, and body and obtain explicit user
 approval first.
+
+### Inbox notification subscriptions
+
+Subscriptions are persistent configuration for a future IMAP inbox watcher.
+This MCP does not start that watcher or deliver events itself. It also never
+creates a subscription automatically: a new installation has no subscriptions,
+so notifications are off.
+
+`create_inbox_subscription` requires:
+
+- a configured consumer's opaque `consumer_id`;
+- a retry-stable `idempotency_key`; and
+- at least one `include` filter rule, or the explicit
+  `all_inbox_mail: true` opt-in.
+
+An exclusion-only subscription is rejected because it would otherwise imply
+opting into almost all mail. A filter rule supports `sender`, `recipient`,
+`subject`, and `mailbox` arrays. Values within one field are alternatives;
+different populated fields in one rule are combined. Sender, recipient, and
+subject matching is case-insensitive substring matching. Mailbox/folder matching
+is case-insensitive equality. Include rules are alternatives, and any matching
+exclude rule wins. Paused subscriptions never match.
+
+For example, this subscribes a configured desktop consumer to urgent build mail
+while filtering expected failures:
+
+```json
+{
+  "idempotency_key": "desktop-build-alerts-v1",
+  "consumer_id": "desktop-notifier",
+  "filter_rules": [
+    {
+      "action": "include",
+      "sender": ["builds@example.com"],
+      "subject": ["failed"],
+      "mailbox": ["INBOX"]
+    },
+    {
+      "action": "exclude",
+      "subject": ["expected failure"]
+    }
+  ]
+}
+```
+
+Creation retries with the same key and normalized request return the original
+subscription instead of creating a duplicate. Keys stay reserved after deletion
+so a late retry cannot recreate a deleted subscription. Updates, pause/resume,
+and deletion accept `expected_revision` for optimistic concurrency. Repeating a
+no-op update does not increment the revision, and repeating deletion returns
+`deleted: false`.
+
+By default, subscription state is stored at
+`$XDG_DATA_HOME/protonmail-mcp/inbox-subscriptions.json`, falling back to
+`~/.local/share/protonmail-mcp/inbox-subscriptions.json`. Override it with
+`PROTON_INBOX_SUBSCRIPTIONS_FILE`. Writes use a same-directory temporary file
+and atomic rename so a watcher cannot observe a partially written document.
 
 ## Prerequisites
 
@@ -71,6 +133,13 @@ PROTON_BRIDGE_SECURITY=starttls
 ```
 
 If you changed ports or connection mode in Bridge, update them here too.
+
+To put persistent inbox subscription state somewhere else, configure an
+absolute path:
+
+```dotenv
+PROTON_INBOX_SUBSCRIPTIONS_FILE=/absolute/path/to/inbox-subscriptions.json
+```
 
 ### TLS certificate
 
@@ -149,3 +218,8 @@ stderr so they do not corrupt the stdio MCP connection.
   `from` address. Proton Bridge performs its own sender validation as well.
 - Searching is scoped to one mailbox because IMAP search operates on the
   selected mailbox. Search multiple mailboxes separately when needed.
+- Inbox notifications remain disabled until a subscription is explicitly
+  created and enabled. `all_inbox_mail: true` is the only filter-free opt-in.
+- Subscription consumers are opaque configured identifiers, not arbitrary
+  callback URLs. The persistence file contains filters and identifiers but no
+  Proton Bridge credentials.

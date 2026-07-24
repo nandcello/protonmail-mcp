@@ -1,7 +1,12 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vite-plus/test";
 import { ConfigurationError } from "../src/config.ts";
+import { InboxSubscriptionStore } from "../src/inbox-subscriptions.ts";
 import { createServer } from "../src/server.ts";
 
 describe("MCP server", () => {
@@ -22,6 +27,11 @@ describe("MCP server", () => {
       expect(response.tools.map((tool) => tool.name)).toEqual([
         "connection_status",
         "list_sender_aliases",
+        "create_inbox_subscription",
+        "list_inbox_subscriptions",
+        "update_inbox_subscription",
+        "set_inbox_subscription_enabled",
+        "delete_inbox_subscription",
         "list_mailboxes",
         "list_emails",
         "search_emails",
@@ -31,6 +41,101 @@ describe("MCP server", () => {
     } finally {
       await client.close();
       await server.close();
+    }
+  });
+
+  test("manages subscriptions without loading Bridge credentials", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "protonmail-server-test-"));
+    const store = new InboxSubscriptionStore(join(directory, "subscriptions.json"));
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const server = createServer(() => {
+      throw new ConfigurationError("Bridge configuration must not be loaded");
+    }, store);
+    const client = new Client({
+      name: "protonmail-mcp-test",
+      version: "1.0.0",
+    });
+
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      const invalid = await client.callTool({
+        name: "create_inbox_subscription",
+        arguments: {
+          idempotency_key: "empty-request",
+          consumer_id: "test-consumer",
+        },
+      });
+      expect(invalid.isError).toBe(true);
+
+      const created = await client.callTool({
+        name: "create_inbox_subscription",
+        arguments: {
+          idempotency_key: "filtered-request",
+          consumer_id: "test-consumer",
+          filter_rules: [{ action: "include", subject: ["urgent"] }],
+        },
+      });
+      expect(created.isError).not.toBe(true);
+      const createdContent = (created as CallToolResult).content[0];
+      if (createdContent.type !== "text") throw new Error("Expected a text tool result");
+      const createdSubscription = JSON.parse(createdContent.text).subscription;
+
+      const listed = await client.callTool({
+        name: "list_inbox_subscriptions",
+        arguments: {},
+      });
+      expect(listed.content).toHaveLength(1);
+      const content = (listed as CallToolResult).content[0];
+      expect(content.type).toBe("text");
+      if (content.type !== "text") throw new Error("Expected a text tool result");
+      expect(JSON.parse(content.text).subscriptions).toHaveLength(1);
+
+      const paused = await client.callTool({
+        name: "set_inbox_subscription_enabled",
+        arguments: {
+          id: createdSubscription.id,
+          enabled: false,
+          expected_revision: createdSubscription.revision,
+        },
+      });
+      expect(paused.isError).not.toBe(true);
+      const pausedContent = (paused as CallToolResult).content[0];
+      if (pausedContent.type !== "text") throw new Error("Expected a text tool result");
+      const pausedSubscription = JSON.parse(pausedContent.text).subscription;
+      expect(pausedSubscription).toMatchObject({ enabled: false, revision: 2 });
+
+      const updated = await client.callTool({
+        name: "update_inbox_subscription",
+        arguments: {
+          id: createdSubscription.id,
+          consumer_id: "replacement-consumer",
+          expected_revision: pausedSubscription.revision,
+        },
+      });
+      if (updated.isError) throw new Error(JSON.stringify(updated));
+      expect(updated.isError).not.toBe(true);
+      const updatedContent = (updated as CallToolResult).content[0];
+      if (updatedContent.type !== "text") throw new Error("Expected a text tool result");
+      const updatedSubscription = JSON.parse(updatedContent.text).subscription;
+      expect(updatedSubscription).toMatchObject({
+        consumerId: "replacement-consumer",
+        revision: 3,
+      });
+
+      const deleted = await client.callTool({
+        name: "delete_inbox_subscription",
+        arguments: {
+          id: createdSubscription.id,
+          expected_revision: updatedSubscription.revision,
+        },
+      });
+      expect(deleted.isError).not.toBe(true);
+      expect(store.list()).toEqual([]);
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
