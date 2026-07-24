@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vite-plus/test";
 import { ConfigurationError } from "../src/config.ts";
-import { InboxSubscriptionStore } from "../src/inbox-subscriptions.ts";
+import { ConfiguredInboxSubscriptionService } from "../src/inbox-subscription-service.ts";
+import { InboxSubscriptionStore } from "../src/inbox-subscription-store.ts";
 import { createServer } from "../src/server.ts";
 
 describe("MCP server", () => {
@@ -47,10 +48,14 @@ describe("MCP server", () => {
   test("manages subscriptions without loading Bridge credentials", async () => {
     const directory = mkdtempSync(join(tmpdir(), "protonmail-server-test-"));
     const store = new InboxSubscriptionStore(join(directory, "subscriptions.json"));
+    const subscriptions = new ConfiguredInboxSubscriptionService(
+      store,
+      new Set(["test-consumer", "replacement-consumer"]),
+    );
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const server = createServer(() => {
       throw new ConfigurationError("Bridge configuration must not be loaded");
-    }, store);
+    }, subscriptions);
     const client = new Client({
       name: "protonmail-mcp-test",
       version: "1.0.0",

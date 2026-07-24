@@ -38,7 +38,8 @@ so notifications are off.
 
 `create_inbox_subscription` requires:
 
-- a configured consumer's opaque `consumer_id`;
+- a `consumer_id` listed in the comma-separated `PROTON_INBOX_CONSUMERS`
+  setting;
 - a retry-stable `idempotency_key`; and
 - at least one `include` filter rule, or the explicit
   `all_inbox_mail: true` opt-in.
@@ -78,13 +79,16 @@ subscription instead of creating a duplicate. Keys stay reserved after deletion
 so a late retry cannot recreate a deleted subscription. Updates, pause/resume,
 and deletion accept `expected_revision` for optimistic concurrency. Repeating a
 no-op update does not increment the revision, and repeating deletion returns
-`deleted: false`.
+`deleted: false`. Rule and matcher order do not affect request identity.
 
 By default, subscription state is stored at
 `$XDG_DATA_HOME/protonmail-mcp/inbox-subscriptions.json`, falling back to
 `~/.local/share/protonmail-mcp/inbox-subscriptions.json`. Override it with
-`PROTON_INBOX_SUBSCRIPTIONS_FILE`. Writes use a same-directory temporary file
-and atomic rename so a watcher cannot observe a partially written document.
+`PROTON_INBOX_SUBSCRIPTIONS_FILE`; both overrides must be absolute paths.
+Mutations hold a cross-process lock for the complete read-modify-write
+transaction, then use a same-directory temporary file and atomic rename so
+concurrent MCP instances cannot lose updates and a watcher cannot observe a
+partially written document.
 
 ## Prerequisites
 
@@ -134,6 +138,12 @@ PROTON_BRIDGE_SECURITY=starttls
 
 If you changed ports or connection mode in Bridge, update them here too.
 
+Configure the opaque IDs that subscriptions may target:
+
+```dotenv
+PROTON_INBOX_CONSUMERS=desktop-notifier,build-alerts
+```
+
 To put persistent inbox subscription state somewhere else, configure an
 absolute path:
 
@@ -174,7 +184,8 @@ typical stdio configuration looks like:
         "PROTON_BRIDGE_USERNAME": "the-username-shown-by-bridge",
         "PROTON_BRIDGE_PASSWORD": "the-password-shown-by-bridge",
         "PROTON_DEFAULT_FROM": "you@proton.me",
-        "PROTON_ALLOWED_SENDERS": "you@proton.me,your-alias@example.com"
+        "PROTON_ALLOWED_SENDERS": "you@proton.me,your-alias@example.com",
+        "PROTON_INBOX_CONSUMERS": "desktop-notifier"
       }
     }
   }
@@ -220,6 +231,6 @@ stderr so they do not corrupt the stdio MCP connection.
   selected mailbox. Search multiple mailboxes separately when needed.
 - Inbox notifications remain disabled until a subscription is explicitly
   created and enabled. `all_inbox_mail: true` is the only filter-free opt-in.
-- Subscription consumers are opaque configured identifiers, not arbitrary
-  callback URLs. The persistence file contains filters and identifiers but no
-  Proton Bridge credentials.
+- Subscription consumers must be opaque identifiers configured in
+  `PROTON_INBOX_CONSUMERS`, not arbitrary callback URLs. The persistence file
+  contains filters and identifiers but no Proton Bridge credentials.
