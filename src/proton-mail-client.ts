@@ -1,4 +1,9 @@
-import { ImapFlow, type ImapFlowOptions, type SearchObject } from "imapflow";
+import {
+  ImapFlow,
+  type CopyResponseObject,
+  type ImapFlowOptions,
+  type SearchObject,
+} from "imapflow";
 import { simpleParser } from "mailparser";
 import { isIP } from "node:net";
 import nodemailer, { type SendMailOptions } from "nodemailer";
@@ -36,6 +41,20 @@ export interface ReadEmail {
   maxCharacters: number;
 }
 
+export interface MoveEmail {
+  mailbox: string;
+  uid: number;
+  destination: string;
+}
+
+export interface MoveEmailResult {
+  moved: true;
+  from: string;
+  to: string;
+  uid: number;
+  newUid?: number;
+}
+
 export interface SendEmail {
   from?: string;
   to: string[];
@@ -54,8 +73,33 @@ export interface ConnectionStatus {
 
 export type ProtonImapClient = Pick<
   ImapFlow,
-  "connect" | "logout" | "list" | "getMailboxLock" | "search" | "fetch" | "fetchOne"
+  | "capabilities"
+  | "connect"
+  | "logout"
+  | "list"
+  | "getMailboxLock"
+  | "search"
+  | "fetch"
+  | "fetchOne"
+  | "messageMove"
+  | "messageCopy"
+  | "messageDelete"
 >;
+
+const FIXED_MOVE_DESTINATIONS = new Set(["INBOX", "Archive", "Trash"]);
+const USER_MAILBOX_PREFIXES = ["Folders/", "Labels/"];
+
+/** IMAP treats INBOX case-insensitively; every other mailbox name is exact. */
+function normalizeMailboxPath(path: string) {
+  return path.toUpperCase() === "INBOX" ? "INBOX" : path;
+}
+
+function isAllowedMoveDestination(path: string) {
+  return (
+    FIXED_MOVE_DESTINATIONS.has(path) ||
+    USER_MAILBOX_PREFIXES.some((prefix) => path.startsWith(prefix) && path.length > prefix.length)
+  );
+}
 
 export interface ProtonSmtpTransport {
   verify(): Promise<true>;
@@ -259,6 +303,54 @@ export class ProtonMailClient {
     });
   }
 
+  async moveEmail({ mailbox, uid, destination }: MoveEmail): Promise<MoveEmailResult> {
+    const from = normalizeMailboxPath(mailbox);
+    const to = normalizeMailboxPath(destination);
+    if (from === to) {
+      throw new Error(`Source and destination are both ${to}; choose a different destination.`);
+    }
+    if (!isAllowedMoveDestination(to)) {
+      throw new Error(
+        `Destination ${to} is not allowed. Use INBOX, Archive, Trash, or an existing Folders/... or Labels/... mailbox.`,
+      );
+    }
+
+    return this.withImap(async (client) => {
+      const mailboxes = await client.list();
+      const target = mailboxes.find(
+        (candidate) =>
+          normalizeMailboxPath(candidate.path) === to &&
+          !candidate.flags.has("\\Noselect") &&
+          !candidate.flags.has("\\NonExistent"),
+      );
+      if (!target) {
+        throw new Error(
+          `Destination mailbox ${to} does not exist. move_email never creates mailboxes.`,
+        );
+      }
+
+      const lock = await client.getMailboxLock(from);
+      try {
+        const existing = await client.fetchOne(uid, { uid: true }, { uid: true });
+        if (!existing) {
+          throw new Error(`Email UID ${uid} was not found in ${from}.`);
+        }
+
+        const result = await this.moveMessage(client, from, uid, target.path);
+        const newUid = result.uidMap?.get(uid);
+        return {
+          moved: true,
+          from,
+          to: target.path,
+          uid,
+          ...(newUid === undefined ? {} : { newUid }),
+        };
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
   async sendEmail(email: SendEmail) {
     const from = email.from ?? this.config.defaultFrom;
     if (!from) {
@@ -298,6 +390,49 @@ export class ProtonMailClient {
     } finally {
       transporter.close();
     }
+  }
+
+  /** Moves one UID out of the selected mailbox without ever expunging other messages. */
+  private async moveMessage(
+    client: ProtonImapClient,
+    from: string,
+    uid: number,
+    destination: string,
+  ): Promise<CopyResponseObject> {
+    const range = String(uid);
+
+    if (client.capabilities.has("MOVE")) {
+      const moved = await client.messageMove(range, destination, { uid: true });
+      if (!moved) {
+        throw new Error(`Bridge refused to move email UID ${uid} from ${from} to ${destination}.`);
+      }
+      return moved;
+    }
+
+    // Without UIDPLUS the only way to finish the fallback is a plain EXPUNGE,
+    // which would also remove any other message already flagged \Deleted.
+    if (!client.capabilities.has("UIDPLUS")) {
+      throw new Error(
+        "Bridge advertises neither MOVE nor UIDPLUS, so the email cannot be moved without risking other messages.",
+      );
+    }
+    if (from === "Trash") {
+      throw new Error("Moving out of Trash requires IMAP MOVE; refusing to expunge from Trash.");
+    }
+
+    const copied = await client.messageCopy(range, destination, { uid: true });
+    if (!copied) {
+      throw new Error(`Bridge refused to copy email UID ${uid} from ${from} to ${destination}.`);
+    }
+
+    // With UIDPLUS advertised, imapflow flags \Deleted and issues UID EXPUNGE for this UID only.
+    const removed = await client.messageDelete(range, { uid: true });
+    if (!removed) {
+      throw new Error(
+        `Copied email UID ${uid} to ${destination}, but could not remove it from ${from}. It may now appear in both mailboxes.`,
+      );
+    }
+    return copied;
   }
 
   private createImapClient() {
