@@ -23,11 +23,24 @@ testing, and packaging.
 | `list_emails`                    | List recent message metadata without changing read state        |
 | `search_emails`                  | Search one mailbox by text, sender, recipient, subject, or date |
 | `read_email`                     | Read a message by mailbox and UID without changing read state   |
+| `move_email`                     | Move a message by mailbox and UID to another existing mailbox   |
 | `send_email`                     | Send a confirmed message from a Proton address or alias         |
 
 `send_email` requires `confirmed: true`. The MCP instructions tell clients to
 show the exact sender, recipients, subject, and body and obtain explicit user
 approval first.
+
+`move_email` moves one message (`mailbox`, default `INBOX`, plus `uid`) to a
+`destination` that already exists when the call is made: `INBOX`, `Archive`,
+`Trash`, or a user `Folders/...` or `Labels/...` mailbox. Any other destination,
+or one equal to the source, is refused, and mailboxes are never created. It uses
+IMAP `UID MOVE`; if Bridge lacks `MOVE` it falls back to `UID COPY` plus a
+`UID EXPUNGE` of that single UID, and refuses outright when `UIDPLUS` is also
+missing rather than risk a mailbox-wide `EXPUNGE`. Nothing is ever permanently
+deleted: moving to Trash is allowed because Proton keeps the message there, and
+the fallback refuses to expunge from Trash. The result is
+`{ moved, from, to, uid, newUid? }`, where `newUid` is the message's UID in the
+destination when Bridge reports it.
 
 ### Inbox notification subscriptions
 

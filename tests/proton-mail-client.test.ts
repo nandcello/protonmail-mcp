@@ -1,4 +1,10 @@
-import type { FetchMessageObject, FetchQueryObject, SearchObject } from "imapflow";
+import type {
+  CopyResponseObject,
+  FetchMessageObject,
+  FetchQueryObject,
+  ListResponse,
+  SearchObject,
+} from "imapflow";
 import type { Options as MailOptions } from "nodemailer/lib/mailer/index.js";
 import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
 import { describe, expect, test } from "vite-plus/test";
@@ -17,6 +23,8 @@ interface FakeImapState {
   releasedLocks: number;
   searches: SearchObject[];
   fetchOneQueries: FetchQueryObject[];
+  locks: Array<{ path: string; readOnly: boolean }>;
+  commands: string[];
 }
 
 interface FakeImapBehavior {
@@ -24,6 +32,14 @@ interface FakeImapBehavior {
   searchResult?: number[] | false;
   fetchedMessages?: FetchMessageObject[];
   fetchOneResults?: Array<FetchMessageObject | false>;
+  capabilities?: string[];
+  mailboxes?: Array<{ path: string; flags?: string[] }>;
+  copyResult?: CopyResponseObject | false;
+  deleteResult?: boolean;
+}
+
+function describeRange(range: Parameters<ProtonImapClient["messageMove"]>[0]) {
+  return typeof range === "string" ? range : JSON.stringify(range);
 }
 
 function createFakeImap(behavior: FakeImapBehavior = {}) {
@@ -33,10 +49,13 @@ function createFakeImap(behavior: FakeImapBehavior = {}) {
     releasedLocks: 0,
     searches: [],
     fetchOneQueries: [],
+    locks: [],
+    commands: [],
   };
   const fetchOneResults = [...(behavior.fetchOneResults ?? [])];
 
   const client: ProtonImapClient = {
+    capabilities: new Map((behavior.capabilities ?? []).map((name) => [name, true])),
     async connect() {
       state.connected += 1;
       if (behavior.connectError) {
@@ -47,9 +66,26 @@ function createFakeImap(behavior: FakeImapBehavior = {}) {
       state.loggedOut += 1;
     },
     async list() {
-      return [];
+      return (behavior.mailboxes ?? []).map(
+        ({ path, flags = [] }) =>
+          ({
+            path,
+            pathAsListed: path,
+            name: path.split("/").at(-1) ?? path,
+            delimiter: "/",
+            parent: [],
+            parentPath: "",
+            flags: new Set(flags),
+            listed: true,
+            subscribed: true,
+          }) satisfies ListResponse,
+      );
     },
-    async getMailboxLock(path) {
+    async getMailboxLock(path, options) {
+      state.locks.push({
+        path: Array.isArray(path) ? path[0] : path,
+        readOnly: options?.readOnly ?? false,
+      });
       return {
         path: Array.isArray(path) ? path[0] : path,
         release() {
@@ -67,6 +103,30 @@ function createFakeImap(behavior: FakeImapBehavior = {}) {
     async fetchOne(_sequence, query) {
       state.fetchOneQueries.push(query);
       return fetchOneResults.shift() ?? false;
+    },
+    async messageMove(range, destination, options) {
+      state.commands.push(`move ${describeRange(range)} ${destination} uid=${options?.uid}`);
+      return {
+        path: "INBOX",
+        destination,
+        uidValidity: 1n,
+        uidMap: new Map([[Number(describeRange(range)), 900]]),
+      };
+    },
+    async messageCopy(range, destination, options) {
+      state.commands.push(`copy ${describeRange(range)} ${destination} uid=${options?.uid}`);
+      return (
+        behavior.copyResult ?? {
+          path: "INBOX",
+          destination,
+          uidValidity: 1n,
+          uidMap: new Map([[Number(describeRange(range)), 901]]),
+        }
+      );
+    },
+    async messageDelete(range, options) {
+      state.commands.push(`delete ${describeRange(range)} uid=${options?.uid}`);
+      return behavior.deleteResult ?? true;
     },
   };
 
@@ -252,5 +312,181 @@ describe("ProtonMailClient", () => {
       disableUrlAccess: true,
     });
     expect(closed).toBe(1);
+  });
+
+  describe("moveEmail", () => {
+    const mailboxes = [
+      { path: "INBOX" },
+      { path: "Archive" },
+      { path: "Trash" },
+      { path: "Spam" },
+      { path: "All Mail" },
+      { path: "Folders", flags: ["\\Noselect"] },
+      { path: "Folders/Jobs" },
+      { path: "Labels/Applied" },
+    ];
+    const message: FetchMessageObject = { seq: 3, uid: 42 };
+
+    test("uses UID MOVE when Bridge advertises MOVE and returns the new UID", async () => {
+      const { client: imap, state } = createFakeImap({
+        capabilities: ["MOVE", "UIDPLUS"],
+        mailboxes,
+        fetchOneResults: [message],
+      });
+      const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+      const result = await client.moveEmail({ mailbox: "inbox", uid: 42, destination: "Archive" });
+
+      expect(result).toEqual({ moved: true, from: "INBOX", to: "Archive", uid: 42, newUid: 900 });
+      expect(state.locks).toEqual([{ path: "INBOX", readOnly: false }]);
+      expect(state.fetchOneQueries).toEqual([{ uid: true }]);
+      expect(state.commands).toEqual(["move 42 Archive uid=true"]);
+      expect(state.releasedLocks).toBe(1);
+      expect(state.loggedOut).toBe(1);
+    });
+
+    test("falls back to UID COPY plus a single-UID expunge when MOVE is missing", async () => {
+      const { client: imap, state } = createFakeImap({
+        capabilities: ["UIDPLUS"],
+        mailboxes,
+        fetchOneResults: [message],
+      });
+      const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+      const result = await client.moveEmail({ mailbox: "INBOX", uid: 42, destination: "Trash" });
+
+      expect(result).toEqual({ moved: true, from: "INBOX", to: "Trash", uid: 42, newUid: 901 });
+      expect(state.commands).toEqual(["copy 42 Trash uid=true", "delete 42 uid=true"]);
+    });
+
+    test("omits newUid when Bridge does not report COPYUID", async () => {
+      const { client: imap } = createFakeImap({
+        capabilities: ["UIDPLUS"],
+        mailboxes,
+        fetchOneResults: [message],
+        copyResult: { path: "INBOX", destination: "Archive" },
+      });
+      const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+      await expect(
+        client.moveEmail({ mailbox: "INBOX", uid: 42, destination: "Archive" }),
+      ).resolves.toEqual({ moved: true, from: "INBOX", to: "Archive", uid: 42 });
+    });
+
+    test("refuses the fallback without UIDPLUS so no mailbox-wide EXPUNGE is issued", async () => {
+      const { client: imap, state } = createFakeImap({
+        capabilities: [],
+        mailboxes,
+        fetchOneResults: [message],
+      });
+      const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+      await expect(
+        client.moveEmail({ mailbox: "INBOX", uid: 42, destination: "Archive" }),
+      ).rejects.toThrow("neither MOVE nor UIDPLUS");
+      expect(state.commands).toEqual([]);
+      expect(state.releasedLocks).toBe(1);
+    });
+
+    test("refuses the fallback out of Trash so nothing is expunged from Trash", async () => {
+      const { client: imap, state } = createFakeImap({
+        capabilities: ["UIDPLUS"],
+        mailboxes,
+        fetchOneResults: [message],
+      });
+      const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+      await expect(
+        client.moveEmail({ mailbox: "Trash", uid: 42, destination: "INBOX" }),
+      ).rejects.toThrow("refusing to expunge from Trash");
+      expect(state.commands).toEqual([]);
+    });
+
+    test("reports a copied-but-not-removed fallback instead of claiming success", async () => {
+      const { client: imap } = createFakeImap({
+        capabilities: ["UIDPLUS"],
+        mailboxes,
+        fetchOneResults: [message],
+        deleteResult: false,
+      });
+      const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+      await expect(
+        client.moveEmail({ mailbox: "INBOX", uid: 42, destination: "Archive" }),
+      ).rejects.toThrow("could not remove it from INBOX");
+    });
+
+    test.each(["Folders/Jobs", "Labels/Applied", "Trash", "INBOX"])(
+      "allows existing destination %s",
+      async (destination) => {
+        const { client: imap, state } = createFakeImap({
+          capabilities: ["MOVE"],
+          mailboxes,
+          fetchOneResults: [message],
+        });
+        const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+        const mailbox = destination === "INBOX" ? "Archive" : "INBOX";
+
+        await expect(client.moveEmail({ mailbox, uid: 42, destination })).resolves.toMatchObject({
+          moved: true,
+          to: destination,
+        });
+        expect(state.commands).toEqual([`move 42 ${destination} uid=true`]);
+      },
+    );
+
+    test.each(["Spam", "All Mail", "Sent", "Folders", "Folders/", "Other/Thing"])(
+      "refuses disallowed destination %s without connecting",
+      async (destination) => {
+        const { client: imap, state } = createFakeImap({ capabilities: ["MOVE"], mailboxes });
+        const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+        await expect(client.moveEmail({ mailbox: "INBOX", uid: 42, destination })).rejects.toThrow(
+          `Destination ${destination} is not allowed.`,
+        );
+        expect(state.connected).toBe(0);
+      },
+    );
+
+    test("refuses an allowed-looking destination that does not exist and never creates it", async () => {
+      const { client: imap, state } = createFakeImap({ capabilities: ["MOVE"], mailboxes });
+      const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+      await expect(
+        client.moveEmail({ mailbox: "INBOX", uid: 42, destination: "Folders/Missing" }),
+      ).rejects.toThrow("Destination mailbox Folders/Missing does not exist.");
+      expect(state.locks).toEqual([]);
+      expect(state.commands).toEqual([]);
+      expect(state.loggedOut).toBe(1);
+    });
+
+    test("refuses a UID that is not in the source mailbox", async () => {
+      const { client: imap, state } = createFakeImap({
+        capabilities: ["MOVE"],
+        mailboxes,
+        fetchOneResults: [false],
+      });
+      const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+      await expect(
+        client.moveEmail({ mailbox: "INBOX", uid: 77, destination: "Archive" }),
+      ).rejects.toThrow("Email UID 77 was not found in INBOX.");
+      expect(state.commands).toEqual([]);
+      expect(state.releasedLocks).toBe(1);
+      expect(state.loggedOut).toBe(1);
+    });
+
+    test.each([
+      ["Archive", "Archive"],
+      ["INBOX", "inbox"],
+    ])("refuses moving from %s to the same mailbox %s", async (mailbox, destination) => {
+      const { client: imap, state } = createFakeImap({ capabilities: ["MOVE"], mailboxes });
+      const client = new ProtonMailClient(createConfig(), createDependencies(imap));
+
+      await expect(client.moveEmail({ mailbox, uid: 42, destination })).rejects.toThrow(
+        "Source and destination are both",
+      );
+      expect(state.connected).toBe(0);
+    });
   });
 });
