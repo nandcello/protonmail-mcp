@@ -37,6 +37,8 @@ describe("MCP server", () => {
         "list_emails",
         "search_emails",
         "read_email",
+        "read_email_full",
+        "get_email_attachment",
         "move_email",
         "send_email",
       ]);

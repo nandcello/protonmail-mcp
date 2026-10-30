@@ -5,9 +5,12 @@ import {
   type SearchObject,
 } from "imapflow";
 import { simpleParser } from "mailparser";
+import { mkdir, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
+import { join } from "node:path";
 import nodemailer, { type SendMailOptions } from "nodemailer";
 import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
+import { extractAttachmentText } from "./attachment-text.ts";
 import type { ProtonBridgeConfig } from "./config.ts";
 import {
   formatParsedAddresses,
@@ -15,6 +18,14 @@ import {
   truncate,
   type EmailSummary,
 } from "./email-utils.ts";
+import {
+  cleanPlainText,
+  describeStructure,
+  htmlToText,
+  truncateWithNotice,
+  type AttachmentInfo,
+} from "./full-email.ts";
+import { connectWithRetry, sharedImapGate, type ImapGate } from "./imap-gate.ts";
 
 const SUMMARY_QUERY = {
   envelope: true,
@@ -40,6 +51,26 @@ export interface ReadEmail {
   uid: number;
   maxCharacters: number;
 }
+
+/** Identifies one message by UID, or by Message-ID searched within the mailbox. */
+export interface EmailLocator {
+  mailbox?: string;
+  uid?: number;
+  messageId?: string;
+}
+
+export interface ReadFullEmail extends EmailLocator {
+  maxCharacters: number;
+}
+
+export interface GetAttachment extends EmailLocator {
+  attachmentId: string;
+  maxCharacters: number;
+  saveToFile: boolean;
+}
+
+/** Message-ID lookups default to All Mail so the message is found wherever it is filed. */
+export const MESSAGE_ID_DEFAULT_MAILBOX = "All Mail";
 
 export interface MoveEmail {
   mailbox: string;
@@ -81,6 +112,7 @@ export type ProtonImapClient = Pick<
   | "search"
   | "fetch"
   | "fetchOne"
+  | "download"
   | "messageMove"
   | "messageCopy"
   | "messageDelete"
@@ -110,7 +142,13 @@ export interface ProtonSmtpTransport {
 export interface ProtonMailClientDependencies {
   createImapClient(config: ProtonBridgeConfig): ProtonImapClient;
   createSmtpTransport(config: ProtonBridgeConfig): ProtonSmtpTransport;
+  /** Defaults to one gate per Bridge endpoint shared by the whole process. */
+  imapGate?: ImapGate;
+  sleep?: (ms: number) => Promise<void>;
 }
+
+const CONNECT_ATTEMPTS = 3;
+const CONNECT_BACKOFF_MS = 400;
 
 export function createImapOptions(config: ProtonBridgeConfig): ImapFlowOptions {
   const secure = config.security === "tls";
@@ -303,6 +341,102 @@ export class ProtonMailClient {
     });
   }
 
+  async readEmailFull({ maxCharacters, ...locator }: ReadFullEmail) {
+    return this.withMessage(locator, async (client, mailbox, uid) => {
+      const message = await this.fetchStructure(client, mailbox, uid);
+      const layout = describeStructure(message.bodyStructure);
+      const usePlain = layout.plain.length > 0;
+      const parts = usePlain ? layout.plain : layout.html;
+
+      const pieces: string[] = [];
+      let downloadTruncated = false;
+      for (const part of parts) {
+        const { content, truncated } = await this.downloadPart(
+          client,
+          uid,
+          part.id,
+          this.config.maxMessageBytes,
+        );
+        downloadTruncated ||= truncated;
+        pieces.push(content.toString("utf8"));
+      }
+
+      const text = usePlain
+        ? cleanPlainText(pieces.join("\n\n"), layout.attachments)
+        : htmlToText(pieces.join("\n"), layout.attachments);
+      const body = truncateWithNotice(text || "(message has no text body)", maxCharacters);
+
+      return {
+        mailbox,
+        ...toEmailSummary(message),
+        bodyFormat: parts.length === 0 ? "none" : usePlain ? "text/plain" : "text/html",
+        body: body.value,
+        bodyTruncated: body.truncated || downloadTruncated,
+        bodyCharacters: body.totalCharacters,
+        attachments: layout.attachments,
+      };
+    });
+  }
+
+  async getAttachment({ attachmentId, maxCharacters, saveToFile, ...locator }: GetAttachment) {
+    if (saveToFile && !this.config.attachmentDirectory) {
+      throw new Error(
+        "Saving attachments is disabled. Set PROTON_ATTACHMENT_DIR to an absolute directory to enable saveToFile.",
+      );
+    }
+
+    return this.withMessage(locator, async (client, mailbox, uid) => {
+      const message = await this.fetchStructure(client, mailbox, uid);
+      const { attachments } = describeStructure(message.bodyStructure);
+      const attachment = attachments.find((candidate) => candidate.id === attachmentId);
+      if (!attachment) {
+        throw new Error(
+          `Attachment ${attachmentId} was not found in UID ${uid} of ${mailbox}. Available: ${attachments.map((candidate) => candidate.id).join(", ") || "none"}.`,
+        );
+      }
+      if (attachment.size > this.config.maxMessageBytes) {
+        throw new Error(
+          `Attachment is about ${attachment.size} bytes, above the configured ${this.config.maxMessageBytes}-byte limit.`,
+        );
+      }
+
+      const { content, truncated } = await this.downloadPart(
+        client,
+        uid,
+        attachment.id,
+        this.config.maxMessageBytes,
+      );
+      if (truncated) {
+        throw new Error(
+          `Attachment exceeded the configured ${this.config.maxMessageBytes}-byte limit while downloading.`,
+        );
+      }
+
+      const extracted = await extractAttachmentText(
+        content,
+        attachment.contentType,
+        attachment.filename,
+      );
+      const text =
+        extracted.text === null ? null : truncateWithNotice(extracted.text, maxCharacters);
+      const savedPath = saveToFile
+        ? await this.saveAttachment(mailbox, uid, attachment, content)
+        : null;
+
+      return {
+        mailbox,
+        uid,
+        attachment: { ...attachment, size: content.byteLength },
+        text: text?.value ?? null,
+        textTruncated: text?.truncated ?? false,
+        textCharacters: text?.totalCharacters ?? 0,
+        ...(extracted.pages === undefined ? {} : { pages: extracted.pages }),
+        note: extracted.note,
+        savedPath,
+      };
+    });
+  }
+
   async moveEmail({ mailbox, uid, destination }: MoveEmail): Promise<MoveEmailResult> {
     const from = normalizeMailboxPath(mailbox);
     const to = normalizeMailboxPath(destination);
@@ -435,6 +569,113 @@ export class ProtonMailClient {
     return copied;
   }
 
+  /** Opens the mailbox read-only (EXAMINE), so no fetch can change \Seen, then resolves the UID. */
+  private async withMessage<T>(
+    { mailbox, uid, messageId }: EmailLocator,
+    operation: (client: ProtonImapClient, mailbox: string, uid: number) => Promise<T>,
+  ): Promise<T> {
+    if ((uid === undefined) === (messageId === undefined)) {
+      throw new Error("Pass exactly one of uid or messageId.");
+    }
+    const path = mailbox ?? (uid === undefined ? MESSAGE_ID_DEFAULT_MAILBOX : "INBOX");
+
+    return this.withImap(async (client) => {
+      const lock = await client.getMailboxLock(path, { readOnly: true });
+      try {
+        const resolved = uid ?? (await this.findByMessageId(client, path, messageId ?? ""));
+        return await operation(client, path, resolved);
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
+  private async findByMessageId(client: ProtonImapClient, mailbox: string, messageId: string) {
+    const bare = messageId.trim().replace(/^<|>$/g, "");
+    if (!bare) throw new Error("messageId must not be empty.");
+
+    // HEADER search is a substring match, so confirm the exact ID from the envelope.
+    const matches = (await client.search({ header: { "message-id": bare } }, { uid: true })) || [];
+    for (const candidate of matches.toSorted((left, right) => right - left)) {
+      const message = await client.fetchOne(String(candidate), { envelope: true }, { uid: true });
+      const found = message && message.envelope?.messageId?.replace(/^<|>$/g, "");
+      if (found === bare) return candidate;
+    }
+    throw new Error(`No email with Message-ID <${bare}> was found in ${mailbox}.`);
+  }
+
+  private async fetchStructure(client: ProtonImapClient, mailbox: string, uid: number) {
+    const message = await client.fetchOne(
+      String(uid),
+      { ...SUMMARY_QUERY, bodyStructure: true },
+      { uid: true },
+    );
+    if (!message) {
+      throw new Error(`Email UID ${uid} was not found in ${mailbox}.`);
+    }
+    if (!message.bodyStructure) {
+      throw new Error(`Bridge returned no MIME structure for UID ${uid} in ${mailbox}.`);
+    }
+    return { ...message, bodyStructure: message.bodyStructure };
+  }
+
+  /** Downloads one decoded MIME part with BODY.PEEK, reporting whether it exceeded maxBytes. */
+  private async downloadPart(
+    client: ProtonImapClient,
+    uid: number,
+    part: string,
+    maxBytes: number,
+  ) {
+    const { content } = await client.download(String(uid), part, {
+      uid: true,
+      maxBytes: maxBytes + 1,
+    });
+    if (!content) {
+      throw new Error(`Could not download part ${part} of email UID ${uid}.`);
+    }
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of content as AsyncIterable<Buffer>) {
+      chunks.push(chunk);
+      total += chunk.length;
+    }
+    const buffer = Buffer.concat(chunks, total);
+    return {
+      content: buffer.subarray(0, maxBytes),
+      truncated: buffer.byteLength > maxBytes,
+    };
+  }
+
+  private async saveAttachment(
+    mailbox: string,
+    uid: number,
+    attachment: AttachmentInfo,
+    content: Buffer,
+  ) {
+    const directory = this.config.attachmentDirectory;
+    if (!directory) throw new Error("PROTON_ATTACHMENT_DIR is not configured.");
+
+    const name = `${mailbox}-${uid}-${attachment.id}-${attachment.filename ?? "attachment"}`
+      .replace(/[^A-Za-z0-9._-]+/g, "_")
+      .slice(-180);
+    const path = join(directory, name);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await writeFile(path, content, { mode: 0o600 });
+    return path;
+  }
+
+  private imapGate() {
+    return (
+      this.dependencies.imapGate ??
+      sharedImapGate(
+        `${this.config.host}:${this.config.imapPort}`,
+        this.config.imapMaxConnections,
+        this.config.imapQueueTimeoutMs,
+      )
+    );
+  }
+
   private createImapClient() {
     return this.dependencies.createImapClient(this.config);
   }
@@ -443,29 +684,52 @@ export class ProtonMailClient {
     return this.dependencies.createSmtpTransport(this.config);
   }
 
+  /**
+   * Runs one operation on a fresh IMAP session. Sessions are admitted through
+   * the shared gate, and only a failed connect is retried with backoff.
+   */
   private async withImap<T>(operation: (client: ProtonImapClient) => Promise<T>): Promise<T> {
-    const client = this.createImapClient();
-    try {
-      await client.connect();
-      return await operation(client);
-    } finally {
-      await client.logout().catch(() => undefined);
-    }
+    return this.imapGate().run(async () => {
+      const client = await connectWithRetry(
+        async () => {
+          const candidate = this.createImapClient();
+          try {
+            await candidate.connect();
+            return candidate;
+          } catch (error) {
+            await candidate.logout().catch(() => undefined);
+            throw error;
+          }
+        },
+        {
+          attempts: CONNECT_ATTEMPTS,
+          baseDelayMs: CONNECT_BACKOFF_MS,
+          ...(this.dependencies.sleep ? { sleep: this.dependencies.sleep } : {}),
+        },
+      );
+      try {
+        return await operation(client);
+      } finally {
+        await client.logout().catch(() => undefined);
+      }
+    });
   }
 
   private async verifyImap() {
-    const client = this.createImapClient();
-    try {
-      await client.connect();
-      return { ok: true };
-    } catch (error) {
-      return {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    } finally {
-      await client.logout().catch(() => undefined);
-    }
+    return this.imapGate().run(async () => {
+      const client = this.createImapClient();
+      try {
+        await client.connect();
+        return { ok: true };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      } finally {
+        await client.logout().catch(() => undefined);
+      }
+    });
   }
 
   private async verifySmtp() {
