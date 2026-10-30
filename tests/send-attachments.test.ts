@@ -322,7 +322,7 @@ describe("send_email attachments over MCP", () => {
     expect(h.sent).toEqual([]);
   });
 
-  test("staging tools never send mail and are not marked destructive", async () => {
+  test("staging tools never send mail and are marked read-only, not destructive", async () => {
     const h = await harness();
     const { tools } = await h.client.listTools();
     for (const name of [
@@ -331,7 +331,11 @@ describe("send_email attachments over MCP", () => {
       "finish_attachment_upload",
     ]) {
       const tool = tools.find((candidate) => candidate.name === name);
-      expect(tool?.annotations).toMatchObject({ destructiveHint: false, openWorldHint: false });
+      expect(tool?.annotations).toMatchObject({
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      });
     }
     expect(tools.find((tool) => tool.name === "send_email")?.annotations).toMatchObject({
       destructiveHint: true,

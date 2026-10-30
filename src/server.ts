@@ -390,7 +390,7 @@ export function createServer(
           .describe("SHA-256 of the whole decoded file; finish verifies it when given."),
       },
       annotations: {
-        readOnlyHint: false,
+        readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: false,
         openWorldHint: false,
@@ -415,7 +415,7 @@ export function createServer(
           .describe("Standard base64 of this chunk only, with padding and no whitespace."),
       },
       annotations: {
-        readOnlyHint: false,
+        readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: false,
         openWorldHint: false,
@@ -432,7 +432,7 @@ export function createServer(
         "Finish a staged upload, verifying totalBytes and sha256 when they were declared. Returns the final size and SHA-256. Only finished uploads can be passed to send_email as attachmentUploadIds. Never sends mail.",
       inputSchema: { uploadId },
       annotations: {
-        readOnlyHint: false,
+        readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
         openWorldHint: false,
