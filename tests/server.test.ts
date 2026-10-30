@@ -40,6 +40,9 @@ describe("MCP server", () => {
         "read_email_full",
         "get_email_attachment",
         "move_email",
+        "start_attachment_upload",
+        "stage_attachment_chunk",
+        "finish_attachment_upload",
         "send_email",
       ]);
     } finally {

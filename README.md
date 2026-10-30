@@ -26,11 +26,50 @@ testing, and packaging.
 | `read_email_full`                | Read one whole message by UID or Message-ID, read-only          |
 | `get_email_attachment`           | Read one attachment as text, images, or byte chunks, read-only  |
 | `move_email`                     | Move a message by mailbox and UID to another existing mailbox   |
+| `start_attachment_upload`        | Start staging a large outgoing attachment in memory             |
+| `stage_attachment_chunk`         | Append the next base64 chunk to a staged attachment             |
+| `finish_attachment_upload`       | Verify and freeze a staged attachment                           |
 | `send_email`                     | Send a confirmed message from a Proton address or alias         |
 
 `send_email` requires `confirmed: true`. The MCP instructions tell clients to
 show the exact sender, recipients, subject, and body and obtain explicit user
 approval first.
+
+### Sending attachments
+
+`send_email` accepts up to 10 attachments and 20 MiB of decoded content in
+total, from two sources that can be combined:
+
+- `attachments: [{ filename, contentType?, contentBase64 }]` for small files.
+  Only these three fields are accepted; anything else (such as `path`) is
+  rejected.
+- `attachmentUploadIds: [uploadId]` for finished staged uploads.
+
+Content must be canonical base64 (standard alphabet, `=` padding, no
+whitespace). Filenames lose path separators, control characters including
+CR/LF, and bidirectional-override characters, and are capped at 200
+characters; an empty result becomes `attachment`. `contentType` must be a plain
+`type/subtype` and defaults to `application/octet-stream`. Attachments are
+handed to nodemailer as in-memory Buffers with file and URL access disabled.
+
+For files too large for one tool call (Executor's `execute` output is capped at
+64 KB), stage them in server memory:
+
+1. `start_attachment_upload { filename, contentType?, totalBytes?, sha256? }`
+   returns `{ uploadId, maxChunkBase64Chars: 45000, ... }`.
+2. `stage_attachment_chunk { uploadId, index, dataBase64 }` for index 0, 1, 2,
+   ... in order. Each chunk is base64 of its own slice of the file, at most
+   45,000 characters (33,750 raw bytes). A repeated or skipped index is
+   rejected, and the error names the next expected index.
+3. `finish_attachment_upload { uploadId }` checks `totalBytes` and `sha256` if
+   they were declared and returns `{ size, sha256 }`.
+4. `send_email { ..., attachmentUploadIds: [uploadId], confirmed: true }`.
+
+A 1.7 MB photo takes 51 chunks. Uploads live only in the server process's
+memory: at most 10 at once, 20 MiB each, and 50 MiB in total. Each upload
+expires 30 minutes after its last activity, and a restart drops them all. A
+successful send deletes the uploads it used; a failed send keeps them so the
+send can be retried. The staging tools never send mail.
 
 `move_email` moves one message (`mailbox`, default `INBOX`, plus `uid`) to a
 `destination` that already exists when the call is made: `INBOX`, `Archive`,
