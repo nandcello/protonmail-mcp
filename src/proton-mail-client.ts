@@ -20,6 +20,7 @@ import {
   type RenderResult,
 } from "./attachment-media.ts";
 import { extractAttachmentText, isPdfAttachment } from "./attachment-text.ts";
+import type { OutgoingAttachment } from "./attachment-uploads.ts";
 import type { ProtonBridgeConfig } from "./config.ts";
 import {
   formatParsedAddresses,
@@ -118,6 +119,8 @@ export interface SendEmail {
   subject: string;
   text: string;
   html?: string;
+  /** Already validated; see prepareOutgoingAttachments. */
+  attachments?: OutgoingAttachment[];
 }
 
 export interface ConnectionStatus {
@@ -670,6 +673,14 @@ export class ProtonMailClient {
         subject: email.subject,
         text: email.text,
         html: email.html,
+        // Built field by field: content is always an in-memory Buffer, never a
+        // path, URL, or raw MIME node taken from the caller.
+        attachments: email.attachments?.map(({ filename, contentType, content }) => ({
+          filename,
+          contentType,
+          content,
+          contentDisposition: "attachment" as const,
+        })),
         disableFileAccess: true,
         disableUrlAccess: true,
       });
