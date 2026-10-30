@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
+import { isAbsolute } from "node:path";
 import { z } from "zod/v4";
 
 const booleanString = z
@@ -28,6 +29,11 @@ const optionalBooleanString = z
 
 const portString = z.coerce.number().int().min(1).max(65_535);
 
+const optionalEmailString = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.email().optional(),
+);
+
 const environmentSchema = z.object({
   PROTON_BRIDGE_USERNAME: z.string().trim().min(1),
   PROTON_BRIDGE_PASSWORD: z.string().min(1),
@@ -37,7 +43,7 @@ const environmentSchema = z.object({
   PROTON_BRIDGE_SECURITY: z.enum(["starttls", "tls"]).default("starttls"),
   PROTON_BRIDGE_TLS_REJECT_UNAUTHORIZED: optionalBooleanString,
   PROTON_BRIDGE_CA_FILE: z.string().trim().min(1).optional(),
-  PROTON_DEFAULT_FROM: z.email().optional(),
+  PROTON_DEFAULT_FROM: optionalEmailString,
   PROTON_ALLOWED_SENDERS: z.string().optional(),
   PROTON_MAX_MESSAGE_BYTES: z.coerce
     .number()
@@ -45,6 +51,16 @@ const environmentSchema = z.object({
     .min(1_024)
     .max(100 * 1_024 * 1_024)
     .default(25 * 1_024 * 1_024),
+  PROTON_IMAP_MAX_CONNECTIONS: z.coerce.number().int().min(1).max(10).default(3),
+  PROTON_IMAP_QUEUE_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(300_000).default(45_000),
+  PROTON_ATTACHMENT_DIR: z
+    .string()
+    .trim()
+    .optional()
+    .transform((value) => (value ? value : undefined))
+    .refine((value) => value === undefined || isAbsolute(value), {
+      message: "Must be an absolute path",
+    }),
 });
 
 export interface ProtonBridgeConfig {
@@ -61,6 +77,9 @@ export interface ProtonBridgeConfig {
   defaultFrom?: string;
   allowedSenders: ReadonlySet<string>;
   maxMessageBytes: number;
+  imapMaxConnections: number;
+  imapQueueTimeoutMs: number;
+  attachmentDirectory?: string;
 }
 
 export class ConfigurationError extends Error {
@@ -132,6 +151,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Proton
       : { defaultFrom: values.PROTON_DEFAULT_FROM }),
     allowedSenders,
     maxMessageBytes: values.PROTON_MAX_MESSAGE_BYTES,
+    imapMaxConnections: values.PROTON_IMAP_MAX_CONNECTIONS,
+    imapQueueTimeoutMs: values.PROTON_IMAP_QUEUE_TIMEOUT_MS,
+    ...(values.PROTON_ATTACHMENT_DIR === undefined
+      ? {}
+      : { attachmentDirectory: values.PROTON_ATTACHMENT_DIR }),
   };
 }
 
@@ -145,5 +169,7 @@ export function publicConfig(config: ProtonBridgeConfig) {
     defaultFrom: config.defaultFrom ?? null,
     allowedSenders: [...config.allowedSenders],
     maxMessageBytes: config.maxMessageBytes,
+    imapMaxConnections: config.imapMaxConnections,
+    attachmentSavingEnabled: config.attachmentDirectory !== undefined,
   };
 }

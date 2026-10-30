@@ -104,6 +104,9 @@ function createFakeImap(behavior: FakeImapBehavior = {}) {
       state.fetchOneQueries.push(query);
       return fetchOneResults.shift() ?? false;
     },
+    async download() {
+      throw new Error("download was not expected in this test.");
+    },
     async messageMove(range, destination, options) {
       state.commands.push(`move ${describeRange(range)} ${destination} uid=${options?.uid}`);
       return {
@@ -142,6 +145,7 @@ function createDependencies(
   return {
     createImapClient: () => imap,
     createSmtpTransport,
+    sleep: async () => undefined,
   };
 }
 
@@ -199,7 +203,7 @@ describe("ProtonMailClient", () => {
     expect(state.loggedOut).toBe(1);
   });
 
-  test("logs out a partially connected IMAP client when connect fails", async () => {
+  test("retries a failed connect and logs out every partially connected client", async () => {
     const { client: imap, state } = createFakeImap({
       connectError: new Error("Bridge is unavailable"),
     });
@@ -207,8 +211,8 @@ describe("ProtonMailClient", () => {
 
     await expect(client.listMailboxes()).rejects.toThrow("Bridge is unavailable");
 
-    expect(state.connected).toBe(1);
-    expect(state.loggedOut).toBe(1);
+    expect(state.connected).toBe(3);
+    expect(state.loggedOut).toBe(3);
   });
 
   test("bounds source download when size metadata is absent and rejects the sentinel byte", async () => {

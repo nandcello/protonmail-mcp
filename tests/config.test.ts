@@ -16,6 +16,26 @@ describe("loadConfig", () => {
     expect(config.security).toBe("starttls");
     expect(config.tls.rejectUnauthorized).toBe(false);
     expect(config.maxMessageBytes).toBe(25 * 1_024 * 1_024);
+    expect(config.imapMaxConnections).toBe(3);
+    expect(config.imapQueueTimeoutMs).toBe(45_000);
+    expect(config.attachmentDirectory).toBeUndefined();
+  });
+
+  test("treats an empty default sender as unset", () => {
+    const config = loadConfig({ ...requiredEnvironment, PROTON_DEFAULT_FROM: " " });
+
+    expect(config.defaultFrom).toBeUndefined();
+    expect(config.allowedSenders.size).toBe(0);
+  });
+
+  test("requires an absolute attachment directory", () => {
+    expect(() =>
+      loadConfig({ ...requiredEnvironment, PROTON_ATTACHMENT_DIR: "relative/dir" }),
+    ).toThrow(ConfigurationError);
+    expect(
+      loadConfig({ ...requiredEnvironment, PROTON_ATTACHMENT_DIR: "/var/lib/mail/attachments" })
+        .attachmentDirectory,
+    ).toBe("/var/lib/mail/attachments");
   });
 
   test("normalizes and enforces configured sender aliases", () => {

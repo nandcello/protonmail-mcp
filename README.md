@@ -23,6 +23,8 @@ testing, and packaging.
 | `list_emails`                    | List recent message metadata without changing read state        |
 | `search_emails`                  | Search one mailbox by text, sender, recipient, subject, or date |
 | `read_email`                     | Read a message by mailbox and UID without changing read state   |
+| `read_email_full`                | Read one whole message by UID or Message-ID, read-only          |
+| `get_email_attachment`           | Extract text from (or save) one attachment, read-only           |
 | `move_email`                     | Move a message by mailbox and UID to another existing mailbox   |
 | `send_email`                     | Send a confirmed message from a Proton address or alias         |
 
@@ -41,6 +43,47 @@ deleted: moving to Trash is allowed because Proton keeps the message there, and
 the fallback refuses to expunge from Trash. The result is
 `{ moved, from, to, uid, newUid? }`, where `newUid` is the message's UID in the
 destination when Bridge reports it.
+
+### Reading full messages and attachments
+
+`read_email_full` takes `mailbox` plus `uid`, or a `messageId` (searched in
+`All Mail` unless `mailbox` is given). It returns from/to/cc/date/subject, the
+plain-text body (or the HTML body converted to text when there is no plain
+part), and every attachment as `{ id, filename, contentType, size, encodedSize,
+inline, contentId }`. The `id` is the IMAP MIME part path (for example `2` or
+`1.2`), which is stable for that message. Only the body text parts are
+downloaded; inline images and `data:`/base64 blobs become placeholders such as
+`[inline image: image.png, 99 KB]`. `maxCharacters` (default 50,000, max
+200,000) caps the body, and a truncated body ends with
+`[truncated: showing N of M characters]`.
+
+```json
+{ "mailbox": "All Mail", "uid": 1350 }
+```
+
+`get_email_attachment` takes the same locator plus `attachmentId`. It extracts
+text from PDFs (via `unpdf`), text, HTML, and attached emails, with the same
+`maxCharacters` cap and notice. Other types return `text: null` and a note.
+`saveToFile: true` also writes the raw file (mode 0600) into
+`PROTON_ATTACHMENT_DIR`; without that absolute directory configured, saving is
+refused.
+
+```json
+{ "mailbox": "All Mail", "uid": 1350, "attachmentId": "2" }
+```
+
+Both tools open the mailbox with `EXAMINE` and fetch only with `BODY.PEEK`, so
+they never set `\Seen`; they never send, move, delete, or flag mail. Attachments
+larger than `PROTON_MAX_MESSAGE_BYTES` are refused.
+
+### Concurrent requests
+
+Every tool call opens its own IMAP session. All sessions in one process share a
+FIFO gate of `PROTON_IMAP_MAX_CONNECTIONS` (default 3) concurrent Bridge
+sessions; extra calls wait up to `PROTON_IMAP_QUEUE_TIMEOUT_MS` (default 45 s)
+and then fail with a clear "Proton Bridge is busy" error. A failed connect is
+retried twice with exponential backoff, except authentication failures. Only
+the connect step is retried, so a retry never repeats a move.
 
 ### Inbox notification subscriptions
 
@@ -235,8 +278,10 @@ stderr so they do not corrupt the stdio MCP connection.
 - Bridge listens only on the local loopback interface; keep this MCP local too.
 - Mail bodies are untrusted input. The server instructs clients not to follow
   commands found inside messages.
-- Attachment contents are never returned. `read_email` only returns attachment
-  names, MIME types, and sizes.
+- `read_email` only returns attachment names, MIME types, and sizes.
+  Attachment contents are only returned by `get_email_attachment`, as extracted
+  text capped by `maxCharacters`, and only written to disk when
+  `PROTON_ATTACHMENT_DIR` is configured.
 - Messages larger than `PROTON_MAX_MESSAGE_BYTES` are refused before parsing.
 - When `PROTON_ALLOWED_SENDERS` is populated, `send_email` rejects any other
   `from` address. Proton Bridge performs its own sender validation as well.
