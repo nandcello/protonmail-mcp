@@ -24,7 +24,7 @@ testing, and packaging.
 | `search_emails`                  | Search one mailbox by text, sender, recipient, subject, or date |
 | `read_email`                     | Read a message by mailbox and UID without changing read state   |
 | `read_email_full`                | Read one whole message by UID or Message-ID, read-only          |
-| `get_email_attachment`           | Extract text from (or save) one attachment, read-only           |
+| `get_email_attachment`           | Read one attachment as text, images, or byte chunks, read-only  |
 | `move_email`                     | Move a message by mailbox and UID to another existing mailbox   |
 | `send_email`                     | Send a confirmed message from a Proton address or alias         |
 
@@ -72,9 +72,55 @@ refused.
 { "mailbox": "All Mail", "uid": 1350, "attachmentId": "2" }
 ```
 
+Images and scanned PDFs:
+
+- PNG, JPEG, GIF, and WebP attachments are also returned as MCP `image`
+  content after the JSON metadata. An image over `maxImageBytes` (default and
+  ceiling `PROTON_MAX_IMAGE_BYTES`, 5 MiB) is downscaled and re-encoded as JPEG
+  if it is PNG or JPEG, and refused with its name, size, and the limit if it is
+  GIF or WebP. Other image types (SVG, TIFF, ...) are never returned as images.
+- `renderPages: true` renders the first `maxPages` (default 5, at most 10) PDF
+  pages as JPEG `image` content at about 150 DPI and at most 1600 px wide, each
+  fitted to `maxImageBytes`; `page: N` renders one page. One call returns at
+  most 10 MiB of page images. Skipped and unrequested pages are listed in
+  `renderedPages` and the `note`. Rendering uses PDFium compiled to
+  WebAssembly, so untrusted PDFs never reach native code.
+
+```json
+{ "mailbox": "All Mail", "uid": 1350, "attachmentId": "1.2" }
+{ "mailbox": "All Mail", "uid": 1350, "attachmentId": "2", "renderPages": true }
+```
+
+Chunk mode is for callers that can only pass small JSON values along, such as
+an Executor `execute` program with a 64 KB output cap. Passing `byteOffset`
+and/or `byteLength` (default 40,000 bytes, about 53 KB of base64) returns no
+text or image content, only a `chunk`:
+
+```json
+{
+  "source": "page",
+  "page": 1,
+  "mimeType": "image/jpeg",
+  "offset": 0,
+  "length": 40000,
+  "totalBytes": 47424,
+  "sha256": "<hash of all 47424 bytes>",
+  "done": false,
+  "nextOffset": 40000,
+  "base64": "..."
+}
+```
+
+The chunked bytes are one rendered page when `page` is set, the downscaled
+image when `maxImageBytes` is set on an image, and otherwise the raw
+attachment. Rendering and encoding are deterministic, so repeat the call with
+`byteOffset: nextOffset` until `done`, concatenate, and compare the SHA-256.
+For a single-call image, ask for `maxImageBytes: 40000, byteOffset: 0`.
+
 Both tools open the mailbox with `EXAMINE` and fetch only with `BODY.PEEK`, so
 they never set `\Seen`; they never send, move, delete, or flag mail. Attachments
-larger than `PROTON_MAX_MESSAGE_BYTES` are refused.
+larger than `PROTON_MAX_MESSAGE_BYTES` are refused. Decoding and rendering
+happen after the IMAP session is released.
 
 ### Concurrent requests
 

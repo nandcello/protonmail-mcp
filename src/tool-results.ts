@@ -7,6 +7,23 @@ export function toolResult(value: unknown): CallToolResult {
   };
 }
 
+/** JSON metadata first, then one image block per image, in the same order. */
+export function toolResultWithImages(
+  value: unknown,
+  images: ReadonlyArray<{ mimeType: string; data: Buffer }>,
+): CallToolResult {
+  return {
+    content: [
+      { type: "text", text: JSON.stringify(value, null, 2) },
+      ...images.map(({ mimeType, data }) => ({
+        type: "image" as const,
+        mimeType,
+        data: data.toString("base64"),
+      })),
+    ],
+  };
+}
+
 function toolFailure(error: unknown): CallToolResult {
   return {
     content: [{ type: "text", text: errorMessage(error) }],

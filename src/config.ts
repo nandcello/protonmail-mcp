@@ -51,6 +51,12 @@ const environmentSchema = z.object({
     .min(1_024)
     .max(100 * 1_024 * 1_024)
     .default(25 * 1_024 * 1_024),
+  PROTON_MAX_IMAGE_BYTES: z.coerce
+    .number()
+    .int()
+    .min(10_000)
+    .max(20 * 1_024 * 1_024)
+    .default(5 * 1_024 * 1_024),
   PROTON_IMAP_MAX_CONNECTIONS: z.coerce.number().int().min(1).max(10).default(3),
   PROTON_IMAP_QUEUE_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(300_000).default(45_000),
   PROTON_ATTACHMENT_DIR: z
@@ -77,6 +83,7 @@ export interface ProtonBridgeConfig {
   defaultFrom?: string;
   allowedSenders: ReadonlySet<string>;
   maxMessageBytes: number;
+  maxImageBytes: number;
   imapMaxConnections: number;
   imapQueueTimeoutMs: number;
   attachmentDirectory?: string;
@@ -151,6 +158,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Proton
       : { defaultFrom: values.PROTON_DEFAULT_FROM }),
     allowedSenders,
     maxMessageBytes: values.PROTON_MAX_MESSAGE_BYTES,
+    maxImageBytes: values.PROTON_MAX_IMAGE_BYTES,
     imapMaxConnections: values.PROTON_IMAP_MAX_CONNECTIONS,
     imapQueueTimeoutMs: values.PROTON_IMAP_QUEUE_TIMEOUT_MS,
     ...(values.PROTON_ATTACHMENT_DIR === undefined
@@ -169,6 +177,7 @@ export function publicConfig(config: ProtonBridgeConfig) {
     defaultFrom: config.defaultFrom ?? null,
     allowedSenders: [...config.allowedSenders],
     maxMessageBytes: config.maxMessageBytes,
+    maxImageBytes: config.maxImageBytes,
     imapMaxConnections: config.imapMaxConnections,
     attachmentSavingEnabled: config.attachmentDirectory !== undefined,
   };
