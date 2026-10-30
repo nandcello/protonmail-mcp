@@ -19,8 +19,8 @@ const TEXT_LIKE_TYPES = new Set([
   "application/ics",
 ]);
 
-function isPdf(contentType: string, filename: string | null) {
-  return contentType === "application/pdf" || /\.pdf$/i.test(filename ?? "");
+export function isPdfAttachment(contentType: string, filename: string | null) {
+  return contentType.toLowerCase() === "application/pdf" || /\.pdf$/i.test(filename ?? "");
 }
 
 /** Extracts readable text from a decoded attachment. Never executes or renders content. */
@@ -31,7 +31,7 @@ export async function extractAttachmentText(
 ): Promise<ExtractedText> {
   const type = contentType.toLowerCase();
 
-  if (isPdf(type, filename)) {
+  if (isPdfAttachment(type, filename)) {
     try {
       // unpdf transfers the buffer to pdf.js, so give it a private copy.
       const pdf = await getDocumentProxy(new Uint8Array(content));
@@ -85,6 +85,6 @@ export async function extractAttachmentText(
 
   return {
     text: null,
-    note: `No text extraction for ${type}. Pass saveToFile=true to write it to a file.`,
+    note: `No text extraction for ${type}. Fetch the raw bytes with byteOffset/byteLength, or pass saveToFile=true.`,
   };
 }

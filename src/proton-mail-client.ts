@@ -10,7 +10,16 @@ import { isIP } from "node:net";
 import { join } from "node:path";
 import nodemailer, { type SendMailOptions } from "nodemailer";
 import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
-import { extractAttachmentText } from "./attachment-text.ts";
+import {
+  chunkBytes,
+  fitImage,
+  normalizeImageType,
+  renderPdfPages,
+  SAFE_IMAGE_TYPES,
+  type ImageOutput,
+  type RenderResult,
+} from "./attachment-media.ts";
+import { extractAttachmentText, isPdfAttachment } from "./attachment-text.ts";
 import type { ProtonBridgeConfig } from "./config.ts";
 import {
   formatParsedAddresses,
@@ -67,7 +76,21 @@ export interface GetAttachment extends EmailLocator {
   attachmentId: string;
   maxCharacters: number;
   saveToFile: boolean;
+  /** Render PDF pages as images (the first maxPages, or just `page`). */
+  renderPages?: boolean;
+  /** 1-based PDF page to render on its own; implies renderPages. */
+  page?: number;
+  maxPages?: number;
+  /** Per-image size target; capped by PROTON_MAX_IMAGE_BYTES. */
+  maxImageBytes?: number;
+  /** Chunk mode: return raw bytes from this offset instead of text and image content. */
+  byteOffset?: number;
+  byteLength?: number;
 }
+
+export const DEFAULT_RENDER_PAGES = 5;
+/** Raw bytes per chunk; ~53 KB as base64, under Executor's 64 KB output cap. */
+export const DEFAULT_CHUNK_BYTES = 40_000;
 
 /** Message-ID lookups default to All Mail so the message is found wherever it is filed. */
 export const MESSAGE_ID_DEFAULT_MAILBOX = "All Mail";
@@ -378,63 +401,199 @@ export class ProtonMailClient {
     });
   }
 
-  async getAttachment({ attachmentId, maxCharacters, saveToFile, ...locator }: GetAttachment) {
+  /**
+   * Returns an attachment's extracted text plus, for images and rendered PDF
+   * pages, image data for MCP image content.
+   */
+  async getAttachment({
+    maxCharacters,
+    renderPages = false,
+    page,
+    maxPages = DEFAULT_RENDER_PAGES,
+    maxImageBytes,
+    ...request
+  }: GetAttachment) {
+    const { base, attachment, content } = await this.downloadAttachment(request);
+    const render = this.checkRender(attachment, renderPages, page);
+    const imageBytes = this.imageBudget(maxImageBytes);
+    const imageType = normalizeImageType(attachment.contentType);
+
+    const extracted = await extractAttachmentText(
+      content,
+      attachment.contentType,
+      attachment.filename,
+    );
+    const text = extracted.text === null ? null : truncateWithNotice(extracted.text, maxCharacters);
+    const notes = [extracted.note];
+    const images: Array<ImageOutput & { page?: number }> = [];
+    let renderedPages: Omit<RenderResult, "rendered"> | undefined;
+
+    if (SAFE_IMAGE_TYPES.has(imageType)) {
+      const output = fitImage(content, imageType, attachment.filename, imageBytes);
+      images.push(output);
+      notes.push(
+        output.reencoded
+          ? `Returned as image content, downscaled to a ${output.width}x${output.height} JPEG to fit ${imageBytes} bytes.`
+          : "Returned as image content.",
+      );
+    } else if (imageType.startsWith("image/")) {
+      notes.push(
+        `${imageType} is not returned as image content. Fetch the raw bytes with byteOffset/byteLength.`,
+      );
+    }
+
+    if (render) {
+      const selection = page === undefined ? { first: maxPages } : { page };
+      const { rendered, ...summary } = await renderPdfPages(content, selection, imageBytes);
+      images.push(...rendered);
+      renderedPages = summary;
+      notes.push(
+        `Rendered ${rendered.length} of ${summary.totalPages} PDF page(s) as JPEG images.${summary.skipped.length > 0 ? ` ${summary.skipped.length} skipped; see renderedPages.skipped.` : ""}${summary.notRequested > 0 ? ` ${summary.notRequested} later page(s) not rendered because maxPages=${maxPages}; use page=N to fetch them.` : ""}`,
+      );
+    }
+
+    return {
+      ...base,
+      text: text?.value ?? null,
+      textTruncated: text?.truncated ?? false,
+      textCharacters: text?.totalCharacters ?? 0,
+      ...(extracted.pages === undefined ? {} : { pages: extracted.pages }),
+      note: notes.join(" "),
+      ...(renderedPages === undefined ? {} : { renderedPages }),
+      images,
+    };
+  }
+
+  /**
+   * Returns one byte range of the raw attachment, of a downscaled image (when
+   * maxImageBytes is set), or of one rendered PDF page (when page is set), with
+   * the SHA-256 of the whole output so callers can verify a reassembled file.
+   * The output is deterministic, so repeated calls slice the same bytes.
+   */
+  async getAttachmentChunk({
+    renderPages = false,
+    page,
+    maxImageBytes,
+    byteOffset = 0,
+    byteLength = DEFAULT_CHUNK_BYTES,
+    ...request
+  }: GetAttachment) {
+    const { base, attachment, content } = await this.downloadAttachment(request);
+    const render = this.checkRender(attachment, renderPages, page);
+    const imageBytes = this.imageBudget(maxImageBytes);
+    const imageType = normalizeImageType(attachment.contentType);
+
+    if (render) {
+      if (page === undefined) {
+        throw new Error("Pass page to fetch one rendered PDF page in chunks.");
+      }
+      const rendered = await renderPdfPages(content, { page }, imageBytes, imageBytes);
+      const output = rendered.rendered[0];
+      if (!output) {
+        throw new Error(rendered.skipped[0]?.reason ?? `Page ${page} could not be rendered.`);
+      }
+      return {
+        ...base,
+        chunk: {
+          source: "page" as const,
+          page,
+          totalPages: rendered.totalPages,
+          width: output.width,
+          height: output.height,
+          ...chunkBytes(output.data, output.mimeType, byteOffset, byteLength),
+        },
+      };
+    }
+
+    if (maxImageBytes !== undefined && SAFE_IMAGE_TYPES.has(imageType)) {
+      const output = fitImage(content, imageType, attachment.filename, imageBytes);
+      return {
+        ...base,
+        chunk: {
+          source: "image" as const,
+          width: output.width,
+          height: output.height,
+          reencoded: output.reencoded,
+          ...chunkBytes(output.data, output.mimeType, byteOffset, byteLength),
+        },
+      };
+    }
+
+    return {
+      ...base,
+      chunk: {
+        source: "attachment" as const,
+        ...chunkBytes(content, attachment.contentType, byteOffset, byteLength),
+      },
+    };
+  }
+
+  /** Downloads one attachment inside an IMAP session; callers decode it after release. */
+  private async downloadAttachment({
+    attachmentId,
+    saveToFile,
+    ...locator
+  }: Pick<GetAttachment, "attachmentId" | "saveToFile" | keyof EmailLocator>) {
     if (saveToFile && !this.config.attachmentDirectory) {
       throw new Error(
         "Saving attachments is disabled. Set PROTON_ATTACHMENT_DIR to an absolute directory to enable saveToFile.",
       );
     }
 
-    return this.withMessage(locator, async (client, mailbox, uid) => {
-      const message = await this.fetchStructure(client, mailbox, uid);
-      const { attachments } = describeStructure(message.bodyStructure);
-      const attachment = attachments.find((candidate) => candidate.id === attachmentId);
-      if (!attachment) {
-        throw new Error(
-          `Attachment ${attachmentId} was not found in UID ${uid} of ${mailbox}. Available: ${attachments.map((candidate) => candidate.id).join(", ") || "none"}.`,
-        );
-      }
-      if (attachment.size > this.config.maxMessageBytes) {
-        throw new Error(
-          `Attachment is about ${attachment.size} bytes, above the configured ${this.config.maxMessageBytes}-byte limit.`,
-        );
-      }
+    const { mailbox, uid, attachment, content } = await this.withMessage(
+      locator,
+      async (client, mailbox, uid) => {
+        const message = await this.fetchStructure(client, mailbox, uid);
+        const { attachments } = describeStructure(message.bodyStructure);
+        const attachment = attachments.find((candidate) => candidate.id === attachmentId);
+        if (!attachment) {
+          throw new Error(
+            `Attachment ${attachmentId} was not found in UID ${uid} of ${mailbox}. Available: ${attachments.map((candidate) => candidate.id).join(", ") || "none"}.`,
+          );
+        }
+        if (attachment.size > this.config.maxMessageBytes) {
+          throw new Error(
+            `Attachment is about ${attachment.size} bytes, above the configured ${this.config.maxMessageBytes}-byte limit.`,
+          );
+        }
 
-      const { content, truncated } = await this.downloadPart(
-        client,
-        uid,
-        attachment.id,
-        this.config.maxMessageBytes,
+        const { content, truncated } = await this.downloadPart(
+          client,
+          uid,
+          attachment.id,
+          this.config.maxMessageBytes,
+        );
+        if (truncated) {
+          throw new Error(
+            `Attachment exceeded the configured ${this.config.maxMessageBytes}-byte limit while downloading.`,
+          );
+        }
+        return { mailbox, uid, attachment, content };
+      },
+    );
+
+    const savedPath = saveToFile
+      ? await this.saveAttachment(mailbox, uid, attachment, content)
+      : null;
+    return {
+      base: { mailbox, uid, attachment: { ...attachment, size: content.byteLength }, savedPath },
+      attachment,
+      content,
+    };
+  }
+
+  private checkRender(attachment: AttachmentInfo, renderPages: boolean, page?: number) {
+    const render = renderPages || page !== undefined;
+    if (render && !isPdfAttachment(attachment.contentType, attachment.filename)) {
+      throw new Error(
+        `renderPages and page only apply to PDF attachments; ${attachment.id} is ${attachment.contentType}.`,
       );
-      if (truncated) {
-        throw new Error(
-          `Attachment exceeded the configured ${this.config.maxMessageBytes}-byte limit while downloading.`,
-        );
-      }
+    }
+    return render;
+  }
 
-      const extracted = await extractAttachmentText(
-        content,
-        attachment.contentType,
-        attachment.filename,
-      );
-      const text =
-        extracted.text === null ? null : truncateWithNotice(extracted.text, maxCharacters);
-      const savedPath = saveToFile
-        ? await this.saveAttachment(mailbox, uid, attachment, content)
-        : null;
-
-      return {
-        mailbox,
-        uid,
-        attachment: { ...attachment, size: content.byteLength },
-        text: text?.value ?? null,
-        textTruncated: text?.truncated ?? false,
-        textCharacters: text?.totalCharacters ?? 0,
-        ...(extracted.pages === undefined ? {} : { pages: extracted.pages }),
-        note: extracted.note,
-        savedPath,
-      };
-    });
+  private imageBudget(requested?: number) {
+    return Math.min(requested ?? this.config.maxImageBytes, this.config.maxImageBytes);
   }
 
   async moveEmail({ mailbox, uid, destination }: MoveEmail): Promise<MoveEmailResult> {
